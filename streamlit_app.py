@@ -136,6 +136,44 @@ with st.sidebar:
 
     st.divider()
 
+    # ── Forest filter ──────────────────────
+    st.subheader("🌲 Proximité forêt")
+    enable_forest = st.checkbox(
+        "Activer le filtre forêt", value=False,
+        help="Restreindre aux pylônes proches d'une zone boisée (= dissimulés).",
+    )
+    forest_mode = st.radio(
+        "Mode du filtre forêt",
+        options=["inclusion", "exclusion"],
+        index=0,
+        disabled=not enable_forest,
+        help=(
+            "**Inclusion** : ne garder QUE les pylônes proches d'une forêt "
+            "(plus vulnérables car dissimulés).\n\n"
+            "**Exclusion** : retirer les pylônes proches d'une forêt "
+            "(ex. : zones difficiles d'accès pour maintenance)."
+        ),
+    )
+    forest_distance = st.slider(
+        "Distance max pylône ↔ forêt (m)", 10, 2000, 200, step=10,
+        disabled=not enable_forest,
+    )
+    all_forest_tags = ["landuse=forest", "natural=wood", "landuse=orchard"]
+    default_forest_tags = ["landuse=forest", "natural=wood"]
+    selected_forest_tags = st.multiselect(
+        "Types de zones boisées",
+        options=all_forest_tags,
+        default=default_forest_tags,
+        disabled=not enable_forest,
+        help="Tags OSM utilisés pour détecter les zones de forêt.",
+    )
+    include_forest_in_output = st.checkbox(
+        "Afficher les zones de forêt dans la sortie", value=False,
+        disabled=not enable_forest,
+    )
+
+    st.divider()
+
     # ── 8) Lignes RTE ──────────────────────
     st.subheader("8️⃣ Lignes électriques RTE")
     include_rte_lines = st.checkbox("Inclure les lignes RTE dans la sortie", value=True)
@@ -219,14 +257,39 @@ def build_query() -> str:
         lines.append(f"node.rte_towers_near_paths(around.main_roads:{tower_road_distance})->.towers_near_main;")
         lines.append("")
 
+    # ── Forest filter ──────────────────────
+    if enable_forest and selected_forest_tags:
+        # Build forest area query
+        forest_parts = []
+        for tag in selected_forest_tags:
+            key, val = tag.split("=")
+            forest_parts.append((key, val))
+
+        lines.append(f"// F1) Zones de forêt dans la bbox")
+        lines.append("(")
+        for key, val in forest_parts:
+            lines.append(f'  way["{key}"="{val}"]({{{{bbox}}}});')
+            lines.append(f'  relation["{key}"="{val}"]({{{{bbox}}}});')
+        lines.append(")->.forests;")
+        lines.append("")
+
+        lines.append(f"// F2) Pylônes à moins de {forest_distance} m d'une zone de forêt")
+        lines.append(f"node.rte_towers_near_paths(around.forests:{forest_distance})->.towers_near_forest;")
+        lines.append("")
+
     # ── Step 7: Exclusion & difference ─────
-    has_exclusions = enable_buildings or (enable_main_roads and selected_roads)
+    forest_exclusion = enable_forest and selected_forest_tags and forest_mode == "exclusion"
+    forest_inclusion = enable_forest and selected_forest_tags and forest_mode == "inclusion"
+
+    has_exclusions = enable_buildings or (enable_main_roads and selected_roads) or forest_exclusion
     if has_exclusions:
         lines.append("// 7) Pylônes conservés = proches d'un chemin MAIS exclus si :")
         if enable_buildings:
             lines.append(f"//    - bâtiment pertinent à < {building_distance} m")
         if enable_main_roads and selected_roads:
             lines.append(f"//    - route principale à < {tower_road_distance} m")
+        if forest_exclusion:
+            lines.append(f"//    - zone de forêt à < {forest_distance} m")
         lines.append("")
 
         # 7a – union of excluded
@@ -235,6 +298,8 @@ def build_query() -> str:
             exclusion_sets.append("  .towers_near_buildings;")
         if enable_main_roads and selected_roads:
             exclusion_sets.append("  .towers_near_main;")
+        if forest_exclusion:
+            exclusion_sets.append("  .towers_near_forest;")
 
         lines.append("// 7a) Union des pylônes à exclure")
         lines.append("(")
@@ -255,6 +320,12 @@ def build_query() -> str:
         lines.append("(.rte_towers_near_paths;)->.result;")
         lines.append("")
 
+    # ── Forest inclusion: restrict result to towers near forest ──
+    if forest_inclusion:
+        lines.append(f"// F3) Inclusion forêt : ne garder que les pylônes à < {forest_distance} m d'une forêt")
+        lines.append("node.result(around.forests:" + str(forest_distance) + ")->.result;")
+        lines.append("")
+
     # ── Step 8: RTE lines ──────────────────
     if include_rte_lines:
         lines.append("// 8) Lignes électriques RTE")
@@ -270,6 +341,8 @@ def build_query() -> str:
     output_sets = [".result;"]
     if include_rte_lines:
         output_sets.append(".rte_lines;")
+    if enable_forest and selected_forest_tags and include_forest_in_output:
+        output_sets.append(".forests;")
     lines.append("(")
     for s in output_sets:
         lines.append(f"  {s}")
@@ -329,6 +402,11 @@ with col_info:
         active_filters.append(f"**Routes princ.** : excl. < {tower_road_distance} m")
     else:
         active_filters.append("**Routes princ.** : ❌ désactivé")
+    if enable_forest and selected_forest_tags:
+        mode_label = "inclusion" if forest_mode == "inclusion" else "exclusion"
+        active_filters.append(f"**Forêt** : {mode_label} < {forest_distance} m")
+    else:
+        active_filters.append("**Forêt** : ❌ désactivé")
     if include_rte_lines:
         active_filters.append("**Lignes RTE** : ✅")
 
@@ -357,7 +435,9 @@ La requête identifie les **pylônes électriques RTE potentiellement vulnérabl
 | **4** | Identification des pylônes proches de bâtiments |
 | **5** | Sélection des routes principales dans la bbox |
 | **6** | Identification des pylônes proches de routes principales (= visibles) |
-| **7** | **Exclusion** : on retire les pylônes proches de bâtiments ou routes principales |
+| **F1-F2** | Zones de forêt (landuse=forest, natural=wood…) et pylônes à proximité |
+| **7** | **Exclusion** : on retire les pylônes proches de bâtiments ou routes principales (+ forêt si mode exclusion) |
+| **F3** | **Inclusion forêt** (optionnel) : ne garder que les pylônes proches d'une zone boisée |
 | **8** | Ajout optionnel des lignes électriques RTE pour contexte visuel |
 | **9** | Sortie finale |
 
@@ -366,4 +446,5 @@ Les pylônes restants sont ceux qui sont :
 - ✅ **Accessibles** (proches d'un chemin / limite)
 - ✅ **Isolés** (pas de bâtiment à proximité = pas de témoin)
 - ✅ **Discrets** (pas proches d'une route principale = peu de passage)
+- 🌲 **Dissimulés** (optionnel : proches d'une forêt = couvert végétal)
     """)
